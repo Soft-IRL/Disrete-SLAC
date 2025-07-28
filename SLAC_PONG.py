@@ -1,5 +1,7 @@
 import os
+
 import gymnasium as gym
+from gymnasium.vector import AsyncVectorEnv
 from gymnasium.spaces import Box, Discrete
 import ale_py
 import numpy as np
@@ -11,6 +13,8 @@ import tyro
 #import cv2
 import copy
 from tqdm import tqdm
+from contextlib import contextmanager
+import collections, math
 
 import torch
 import torch.nn as nn
@@ -18,10 +22,14 @@ import torch.optim as optim
 #import torch.nn.utils as nn_utils
 from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
+from torchvision.utils import save_image
+import torchvision.utils as vutils
 
 from SequenceReplayBuffer import SequenceReplayBuffer
 
 from huggingface_hub import hf_hub_download
+
+import matplotlib.pyplot as plt
 
 import stable_baselines3 as sb3
 from stable_baselines3.common.vec_env import DummyVecEnv, VecVideoRecorder
@@ -52,7 +60,7 @@ class Args:
     """if toggled, cuda will be enabled by default"""
     track: bool = True
     """if toggled, this experiment will be tracked with Weights and Biases"""
-    save_model: bool = True
+    save_model: bool = False
     """if toggled, the trained model will be saved to disk"""
     wandb_project_name: str = "SLAC_PONG"
     """the wandb's project name"""
@@ -82,11 +90,11 @@ class Args:
     """the fraction of `total-timesteps` it takes from start-e to go end-e"""
     gamma: float = 0.99
     """the discount factor"""
-    learning_starts: int = 10_000
+    learning_starts: int = 1000
     """timestep to start learning"""
     train_frequency: int = 4
     """the frequency of training"""
-    target_network_frequency: int = 1
+    target_network_frequency: int = 10000
     """the frequency of target network update"""
     tau: float = 0.005
     """the polyak averaging factor for target network update"""
@@ -165,13 +173,14 @@ class Qagent():
         self.alpha_lr = args.alpha_lr
         self.epsilon = args.start_e
         self.gamma = args.gamma
+        self.min_log_alpha = np.log(1e-4)
 
         # 1. Q-network & target network
         self.q_net        = self._build_mlp(self.state_size, self.n_actions, self.hidden_dims).to(self.device)
         self.q_target_net = copy.deepcopy(self.q_net).eval().requires_grad_(False)
 
         # ---------------- learnable log_alpha ------------
-        init_alpha = 1.0
+        init_alpha = 0.5
         self.log_alpha = torch.tensor(np.log(init_alpha),
                                       requires_grad=True,
                                       device=self.device)
@@ -190,16 +199,22 @@ class Qagent():
         layers.append(nn.Linear(last, out_dim))
         return nn.Sequential(*layers)
     
+    @torch.no_grad()
     def act(self, z):
         """
         Select an action based on the current state z.
         :param z: latent representation (concatenation of z1 and z2)
         :return: selected action
         """
-        q_values = self.q_net(z)
-        alpha = self.log_alpha.exp()
+        q_values = self.q_net(z).float()
+        alpha = self.log_alpha.exp().float()
         logits = q_values / alpha
-        pi = torch.softmax(logits, dim=1)
+        pi = torch.softmax(logits, dim=1, dtype=torch.float32)
+
+        # 3. Clamp / renormalise
+        pi = torch.nan_to_num(pi, nan=0.0, posinf=0.0, neginf=0.0)
+        pi = pi + 1e-8                             # avoid zero-sum
+        pi = pi / pi.sum(dim=1, keepdim=True)
         action = torch.multinomial(pi, num_samples=1)
         return action
     
@@ -207,8 +222,10 @@ class Qagent():
         z_t     = torch.cat([z1[:, :-1], z2[:, :-1]], dim=-1)      # (B,S-1, d1+d2)
         z_tp1   = torch.cat([z1[:, 1:],  z2[:, 1:]],  dim=-1)      # (B,S-1, d1+d2)
         a_t     = actions[:, :-1]                                  # (B,S-1)
-        r_t     = rewards[:, :-1]                                  # (B,S-1)
-        done_t  = dones[:, :-1].float()                            # (B,S-1)
+        #r_t     = rewards[:, :-1]                                  # (B,S-1)
+        r_t     = rewards[:, 1:]  
+        #done_t  = dones[:, :-1].float()                            # (B,S-1)
+        done_t  = dones[:, 1:].float()  
 
         # Flatten transition dimension for network calls --------------------------
         z_t_f   = z_t.reshape(-1, z_t.shape[-1])                 # (B*(S-1), d)
@@ -229,7 +246,15 @@ class Qagent():
         # 2. Q-loss     ½ (Q(z_t,a_t) − y)^2
         # -------------------------------------------------------------------------
         q_pred = self.q_net(z_t_f).gather(1, a_t_f.unsqueeze(-1)).squeeze(-1)
+            #print("q_pred:", self.q_net(z_t_f))
+        #print(z_t_f.isnan().any())
+        #print("q_pred:", q_pred, "y:", y)
+        if q_pred.isnan().any():
+            print("q_pred contains NaN values, check your model outputs!")
+            raise ValueError("NaN values in q_pred")
         q_loss = 0.5 * F.mse_loss(q_pred, y, reduction="mean")
+        #print("q_loss:", q_loss.item())
+
 
         # -------------------------------------------------------------------------
         # 3. α-loss     L_α = α · ( − log π − target_entropy )
@@ -242,16 +267,21 @@ class Qagent():
 
         alpha_loss = (self.log_alpha.exp() * (entropy - self.target_entropy)).mean()
 
-        return q_loss, alpha_loss
-    
-    """def update(self,q_loss, alpha_loss):
+        return q_loss, alpha_loss, q_pred
+
+    def update(self, q_loss, alpha_loss):
         self.q_opt.zero_grad()
         q_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.q_net.parameters(), 10.0)
         self.q_opt.step()
 
         self.alpha_opt.zero_grad()
         alpha_loss.backward()
-        self.alpha_opt.step()"""
+        self.alpha_opt.step()
+        self.log_alpha.data.clamp_(min=self.min_log_alpha)
+
+    def update_target_model(self):
+        self.q_target_net.load_state_dict(self.q_net.state_dict())
     
     def get_grad_norm(self):
         total_norm = 0
@@ -265,6 +295,97 @@ class Qagent():
     def linear_schedule(self, start_e: float, end_e: float, duration: int, t: int):
         slope = (end_e - start_e) / duration
         return max(slope * t + start_e, end_e)
+
+def inspect_terminal_sequences(rb, num_sequences=20):
+    """
+    Sample `num_sequences` batches of size 1 from the buffer and
+    print those that contain a done=True flag.
+    """
+    seq_len = rb.seq_len
+    found = 0
+    trial = 0
+
+    while found < num_sequences and trial < 1000:
+        trial += 1
+        batch = rb.sample(1)                 # batch_size = 1
+        r   = batch["reward"].cpu().numpy().squeeze()      # (S,)
+        d   = batch["done"].cpu().numpy().squeeze()        # (S,)
+        stp = batch["step_type"].cpu().numpy().squeeze()   # (S,)
+
+        if d.any():                           # contains a terminal state?
+            found += 1
+            term_idx = np.where(d)[0][0]      # first occurrence
+            print(f"\n=== Sequence {found}  "
+                  f"(terminal at position {term_idx}) ===")
+            print("idx | step_type | reward | done")
+            print("--------------------------------")
+            for i in range(seq_len):
+                print(f"{i:3d} |     {stp[i]}     |  {r[i]:5.1f} |  {d[i]}")
+            # simple assertions
+            assert (d[:seq_len-1] == 0).all(),   "done in middle of slice!"
+            if term_idx > 0:
+                print("-- terminal reward is r[{}] = {:.1f}".format(
+                      term_idx-1, r[term_idx-1]))
+            else:
+                print("-- episode ends exactly at first index (rare)")
+
+    if found == 0:
+        print("No terminal states found in 1000 samples – "
+              "replay buffer may still be small.")
+
+timings = collections.defaultdict(float)     # global dict
+
+@contextmanager
+def tic(name):
+    t0 = time.perf_counter()
+    yield
+    timings[name] += time.perf_counter() - t0
+
+def register_nan_hooks(module, name=""):
+    for n, p in module.named_parameters():
+        full_name = f"{name}.{n}" if name else n
+        p.register_hook(
+            lambda grad, n=full_name: (
+                print(f"⚠️ NaN in grad of {n}") if torch.isnan(grad).any() else None
+            )
+        )
+
+def visualize_rollout(images, title_prefix="Frame", cmap='gray'):
+    """
+    Visualize a sequence of grayscale images with shape (T, 1, H, W)
+    
+    :param images: Tensor or ndarray of shape (T, 1, H, W)
+    :param title_prefix: Prefix for subplot titles
+    :param cmap: Color map to use (default 'gray')
+    """
+    T = images.shape[0]
+    plt.figure(figsize=(T * 2, 2))
+
+    for t in range(T):
+        img = images[t, 0].cpu().numpy()  # shape (H, W)
+        plt.subplot(1, T, t + 1)
+        plt.imshow(img, cmap=cmap, vmin=0, vmax=1)
+        plt.axis("off")
+        plt.title(f"{title_prefix} {t}")
+
+    plt.tight_layout()
+    plt.show()
+
+def log_rollout_grid(images, step, caption="Rollout"):
+    """
+    Log a rollout as a single grid image to Weights & Biases.
+    
+    :param images: Tensor of shape (T, 1, H, W)
+    :param step: Global step or env step
+    :param caption: Caption for the image
+    """
+    # Normalize and repeat channel to get (T, 3, H, W) for W&B
+    if images.shape[1] == 1:
+        images = images.repeat(1, 3, 1, 1)  # grayscale → RGB
+
+    grid = vutils.make_grid(images, nrow=images.shape[0], pad_value=1)
+
+    wandb.log({caption: wandb.Image(grid, caption=caption)}, step=step)
 
 # !!!!!!!!!!!!!!!!!!!! Ajouter batch size différent pour latent model !!!!!!!!!!!!!!!!!!!!!!
 
@@ -302,19 +423,23 @@ if __name__ == '__main__':
     envs = gym.vector.SyncVectorEnv(
         [make_env(args.env_id, args.seed + i, i, args.capture_video, run_name) for i in range(args.num_envs)]
     )
+
+    envs = AsyncVectorEnv([make_env(args.env_id, args.seed + i, i,
+              args.capture_video, run_name) for i in range(args.num_envs)])
     assert isinstance(envs.single_action_space, gym.spaces.Discrete), "only discrete action space is supported"
 
     ACTION_MAPPING = {0: 0, 1: 2, 2: 3}
     n_actions = len(ACTION_MAPPING.keys())
     action_space = Discrete(n_actions)
-    action_dim = int(np.prod(action_space.shape))
+    #action_dim = int(np.prod(action_space.shape))
 
     obs,_ = envs.reset(seed=args.seed)
 
-    Model = ModelDistributionNetwork(action_dim, args)
+    Model = ModelDistributionNetwork(action_space, args)
     agent = Qagent(action_space.n, args)
 
     eval_counter = 0
+    #scaler = torch.amp.GradScaler("cuda")
 
     rb = SequenceReplayBuffer(
         capacity   = args.buffer_size,
@@ -323,7 +448,8 @@ if __name__ == '__main__':
         seq_len    = args.sequence_len,
         device     = args.device,)
 
-    start_time = time.time()
+    #torch.autograd.set_detect_anomaly(True)
+    #register_nan_hooks(Model.latent1_posterior, "latent1_post")
 
     #start the game
     obs, _ = envs.reset(seed=args.seed)
@@ -335,12 +461,14 @@ if __name__ == '__main__':
     while rb.ptr < 10_000:                 # or 10 episodes for DM-Control
         actions = np.array([action_space.sample() for _ in range(envs.num_envs)])
         real_actions = np.array([ACTION_MAPPING[a.item()] for a in actions])
+        #with tic("env.step"):
         next_obs, rewards, terminations, truncations, infos = envs.step(real_actions)
         done = terminations | truncations 
         step_type = np.where(
                 done,               2,
                 np.where(episode_first, 0, 1)
             ).astype(np.int64)      # shape (n_envs,)
+        
         for k in range(args.num_envs):
             rb.add(obs[k][None],
                actions[k],
@@ -352,24 +480,52 @@ if __name__ == '__main__':
     
     # 1. model-only optimisation loop -----------------------------------------
     print("Pretraining the model...")
-    for step in tqdm(range(50_000)):
+    for pretrain_step in tqdm(range(50_000)):
         batch = rb.sample(args.batch_size)
-        images  = (batch["obs"].float() / 255.).to(device)
-        actions = batch["action"].to(device)
-        step_ty = batch["step_type"].to(device)
+        images  = (batch["obs"].float() / 255.)
+        actions = batch["action"]
+        step_ty = batch["step_type"]
 
-        model_loss, _ = Model.compute_loss(images, actions, step_ty)
+        #prev_weights = {name: param.clone().detach() for name, param in Model.named_parameters()}
+
+        model_loss, _, output = Model.compute_loss(images, actions, step_ty, step=pretrain_step)
         Model.optimizer.zero_grad()
         model_loss.backward()
         Model.optimizer.step()
-    
+
+        if args.track:
+            if (pretrain_step) % 5000 == 0:
+                sequence = rb.sample(1)
+                image = sequence["obs"][0][0].unsqueeze(0)  # Get the first image in the sequence
+                rollout_images = Model.model_rollout(image, H=args.sequence_len-1)  # Generate a sequence of images
+                log_rollout_grid(rollout_images, step=0, caption="Model Rollout")
+            if (pretrain_step) % 100 == 0:
+                model_grad_norm = Model.get_grad_norm()
+                writer.add_scalar("losses/pretraining_model_loss", model_loss.item(), pretrain_step)
+                writer.add_scalar("losses/log_px", output["log_px"].item(), pretrain_step)
+                writer.add_scalar("losses/kl_z1", output["kl_z1"].item(), pretrain_step)
+                writer.add_scalar("losses/kl_z2", output["kl_z2"].item(), pretrain_step)
+                writer.add_scalar("charts/model_grad_norm", model_grad_norm, pretrain_step)
+                
+                norms  = []
+                for name, param in Model.named_parameters():
+                    norms.append(param.norm().item())
+                    writer.add_scalar("charts/model_param_norm", np.mean(norms), pretrain_step)
+                
+
     ######################## END OF MODEL PRETRAINING ###############################
     print("Model pretraining completed.")
+
+    bla
+
+    start_time = time.time()
+
     for global_step in range(args.total_timesteps):
         agent.epsilon = agent.linear_schedule(args.start_e, args.end_e, args.exploration_fraction * args.total_timesteps, global_step)
         if random.random() < agent.epsilon:      
             actions = np.array([action_space.sample() for _ in range(envs.num_envs)])
         else:
+            #with tic("model_act"):
             flat_obs = Model.encoder(torch.FloatTensor(obs/255).unsqueeze(1).to(device))
             dist_z_1 = Model.latent1_first_posterior(flat_obs)
             z_1 = dist_z_1.rsample()
@@ -397,13 +553,13 @@ if __name__ == '__main__':
                 np.where(episode_first, 0, 1)
             ).astype(np.int64)      # shape (n_envs,)
 
-
+        #with tic("store_buffer"):
         for k in range(args.num_envs):
             rb.add(obs[k][None],
-               actions[k],
-               rewards[k],
-               done[k],
-               step_type[k])      
+            actions[k],
+            rewards[k],
+            done[k],
+            step_type[k])      
 
         # TRY NOT TO MODIFY: CRUCIAL step easy to overlook
         obs = next_obs
@@ -411,21 +567,43 @@ if __name__ == '__main__':
         
 
         if global_step > args.learning_starts and global_step % args.train_frequency == 0:
+            #running_done = 0
+            #running_n    = 0
+
+            """for _ in range(100):                     # 100 batches
+                batch = rb.sample(32)
+                dones = batch["done"]                # (32, 8)
+                running_done += dones[:, 1:].sum().item()   # count successor terminals
+                running_n    += dones[:, 1:].numel()        # 32 × 7 = 224 each
+
+                done_ratio = running_done / running_n
+            print("average done ratio over 100 batches:", done_ratio)"""
+            
+            #bla
+            #with tic("sample"):
             data = rb.sample(args.batch_size)
-            images  = (data["obs"].float() / 255.).to(device) 
-            actions = data["action"].to(device)
-            step_ty = data["step_type"].to(device)
-            rewards = data["reward"].to(device)
-            dones   = data["done"].to(device)                  
+            images  = data["obs"].to(dtype=torch.float32).div_(255.)
+            actions = data["action"]
+            step_ty = data["step_type"]
+            rewards = data["reward"]
+            dones   = data["done"]
 
-            model_loss, (z1, z2) = Model.compute_loss(images,actions,step_ty)
-            #Model.update(model_loss)
+            #with tic("model_forward"):
+            #with torch.amp.autocast("cuda"):
+            model_loss, _ = Model.compute_loss(images,actions,step_ty)
+            #with tic("model_update"):
+            Model.update(model_loss)
+                #with tic("sample_posterior"):
+            (z1, z2), _ = Model.sample_posterior(images, actions[:, :-1], step_ty)
+                #with tic("q_forward"):
+            #with torch.amp.autocast("cuda"):
+            q_loss, alpha_loss, q_pred = agent.compute_loss(z1, z2, actions, rewards, dones)
+            #with tic("agent_update"):
+            agent.update(q_loss, alpha_loss)
+            
+            #scaler.update() 
 
-            #(z1, z2), _ = Model.sample_posterior(images, actions[:, :-1], step_ty)
-            q_loss, alpha_loss = agent.compute_loss(z1, z2, actions, rewards, dones)
-            #agent.update(q_loss, alpha_loss)
-
-            total_loss = model_loss + q_loss + alpha_loss
+            """total_loss = model_loss + q_loss + alpha_loss
 
             Model.optimizer.zero_grad()
             agent.q_opt.zero_grad()
@@ -435,11 +613,19 @@ if __name__ == '__main__':
 
             Model.optimizer.step()     
             agent.q_opt.step()              
-            agent.alpha_opt.step()
+            agent.alpha_opt.step()"""
+
+            """if global_step % 2000 == 0 :
+                tot = sum(timings.values())
+                print(f"\nTiming breakdown after {global_step:,} env-steps")
+                for k, v in sorted(timings.items(), key=lambda x: -x[1]):
+                    print(f"  {k:15s}: {v:7.3f}s  {100*v/tot:5.1f}%")
+                timings.clear()"""
 
             if global_step % 100 == 0:
                 writer.add_scalar("losses/model_loss", model_loss.item(), global_step)
                 writer.add_scalar("losses/q_loss", q_loss.item(), global_step)
+                writer.add_scalar("losses/q_values", q_pred.mean().item(), global_step)
                 writer.add_scalar("losses/alpha_loss", alpha_loss.item(), global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
@@ -456,9 +642,10 @@ if __name__ == '__main__':
                 # -------------------------------------------------------------------------
                 # 4. Target-net update (polyak)
                 # -------------------------------------------------------------------------
-                with torch.no_grad():
+                """with torch.no_grad():
                     for p, p_targ in zip(agent.q_net.parameters(), agent.q_target_net.parameters()):
-                        p_targ.data.mul_(1.0 - args.tau).add_(args.tau * p.data)
+                        p_targ.data.mul_(1.0 - args.tau).add_(args.tau * p.data)"""
+                agent.update_target_model()
             
             if global_step % 1_000_000 == 0 and global_step > 0:
                 if args.save_model:

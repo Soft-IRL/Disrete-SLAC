@@ -4,7 +4,12 @@ from torch.distributions import MultivariateNormal, Normal, Independent, Bernoul
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
+from torchvision.utils import save_image
 import functools
+
+# helper to print tensor stats
+def stats(t, tag):
+    print(f"{tag}: min={t.min():.3e}  max={t.max():.3e}  mean={t.mean():.3e}  NaNs={torch.isnan(t).sum()}")
 
 class StepType:
     FIRST = 0
@@ -33,7 +38,9 @@ class MultivariateNormalDiag(nn.Module):
             x = inputs[0]
 
         x = F.leaky_relu(self.fc1(x))
+        #stats(x, "after fc1")             # <--- add this
         x = F.leaky_relu(self.fc2(x))
+        #stats(x, "after fc2")             # <--- and this
         out = self.output_layer(x)
 
         loc = out[..., :self.latent_size]
@@ -127,7 +134,7 @@ class Decoder(nn.Module):
     - Decoder output (reconstruction): (B, N, T, H, W, C)
     """
 
-    def __init__(self, base_depth, channels=3, scale=1.0):
+    def __init__(self, base_depth, channels=1, scale=1.0):
         super().__init__()
         self.register_buffer("scale", torch.tensor(scale, dtype=torch.float32))
         self.leaky_relu = nn.LeakyReLU()
@@ -173,13 +180,14 @@ class Decoder(nn.Module):
 
 
 class ModelDistributionNetwork(nn.Module):
-    def __init__(self, action_dim, args, model_reward=False, model_discount=False,
-                 decoder_stddev=np.sqrt(0.1, dtype=np.float32), reward_stddev=None):
+    def __init__(self, action_space, args, model_reward=False, model_discount=False,
+                 decoder_stddev=0.05, reward_stddev=None):
         
         super().__init__()
         self.base_depth = args.base_depth
         self.encoder_output_size = 8 * self.base_depth
-        self.action_dim = action_dim
+        self.action_space = action_space
+        self.action_dim = int(np.prod(action_space.shape))
         self.device = args.device
         self.lr = args.m_learning_rate
         self.epsilon = args.start_e
@@ -219,13 +227,13 @@ class ModelDistributionNetwork(nn.Module):
         # gather *all* parameters of sub-modules registered above
         self.optimizer = optim.Adam(self.parameters(), lr=self.lr)
     
-    """def update(self, loss):
+    def update(self, loss):
         self.optimizer.zero_grad()
-        loss.backward()
-        self.optimizer.step()"""
-        
+        loss.backward() 
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 20.0)
+        self.optimizer.step()
 
-    def compute_loss(self, images, actions, step_types, rewards=None, discounts=None, latent_posterior_samples_and_dists=None):
+    def compute_loss(self, images, actions, step_types, step=None, rewards=None, discounts=None, latent_posterior_samples_and_dists=None):
         
         #This gets the number of transitions, which is one less than the number of steps.
         sequence_length = step_types.shape[1] - 1
@@ -253,13 +261,24 @@ class ModelDistributionNetwork(nn.Module):
         x_dist   = self.decoder(z1_post, z2_post)           # p(x|z)  Independent Normal
         log_px   = x_dist.log_prob(images).sum(1)           # (B,)
 
-        # ------------------------------------------------------------------ ELBO
-        elbo = log_px - kl_z1 - kl_z2
+        # KL warm-up or β-VAE
+        if step is not None:
+            beta = min(1.0, step / 25000)     # linearly annealed over e.g. 10k steps
+            C_max   = 3.0                       # nats
+            C       = C_max * min(1.0, step/25_000)
+        else: 
+            beta = 1.0                         # no annealing, just use β=1
+            C = 0
+        elbo = log_px - (kl_z1 - C).abs() - beta * kl_z2
 
         # ------------------------------------------------ loss
         loss = -elbo.mean()
 
-        return loss, (z1_post, z2_post)
+        output = {"log_px": log_px.mean(),
+                  "kl_z1": kl_z1.mean(),
+                  "kl_z2": kl_z2.mean()}
+
+        return loss, (z1_post, z2_post), output
 
 
     def sample_posterior(self, images, actions, step_types, features=None):
@@ -356,6 +375,55 @@ class ModelDistributionNetwork(nn.Module):
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
         return total_norm
+    
+    @torch.no_grad()
+    def model_rollout(
+        self,                     # your trained ModelDistributionNetwork
+        init_obs,                  # (1, 1, H, W) uint8 tensor  (single frame)
+        H     = 7):                 # horizon (so total frames = H+1):
+        """
+        Returns: decoded_imgs: (H+1, 1, H, W) float32 in [0,1]
+        """
+        self.eval()
+
+        # ---- 0. put on device, normalise ----------------------------------
+        obs_t = init_obs.to(self.device, dtype=torch.float32) / 255.0  # (1,1,H,W)
+
+        decoded = []                       # list of reconstructions
+        decoded.append(obs_t)              # original frame at t=0
+
+        # ---- 1. encode initial obs → z1_0, z2_0  ---------------------------
+        feat   = self.encoder(obs_t)                    # (1, feat)
+        z1_0   = self.latent1_first_posterior(feat).sample()
+        z2_0   = self.latent2_first_posterior(z1_0).sample()
+
+        z1_t, z2_t = z1_0, z2_0
+
+        # ---- 2. autoregressive rollout -------------------------------------
+        for t in range(H):
+            # » pick an action
+            a_t = torch.tensor(self.action_space.sample()).reshape(1,1).to(self.device)  # (1, action_dim)
+            # • p(z1_{t+1} | z2_t, a_t)
+            z1_dist = self.latent1_prior(torch.cat([z2_t, a_t], dim=-1))
+            z1_t1   = z1_dist.sample()
+
+            # • p(z2_{t+1} | z1_{t+1}, z2_t, a_t)
+            z2_dist = self.latent2_prior(torch.cat([z1_t1, z2_t, a_t], dim=-1))
+            z2_t1   = z2_dist.sample()
+
+            # • decode image  p(x_{t+1}|z1_{t+1},z2_{t+1})
+            img_dist = self.decoder(z1_t1, z2_t1)          # Independent Normal
+            x_mean   = img_dist.mean.clamp(0, 1)            # (1,1,H,W)
+            decoded.append(x_mean)
+
+            # · shift latents
+            z1_t, z2_t = z1_t1, z2_t1
+
+        # ---- 3. stack & save grid ------------------------------------------
+        imgs = torch.cat(decoded, dim=0)   # (H+1,1,H,W)
+        #save_image(imgs, "rollout.png", nrow=H+1)
+
+        return imgs  # (H+1,1,H,W)
 
 def stack_distributions(dists):
     locs = torch.stack([d.base_dist.loc for d in dists], dim=1)
