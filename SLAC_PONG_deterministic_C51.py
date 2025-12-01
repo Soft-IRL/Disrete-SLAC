@@ -82,7 +82,7 @@ class Args:
     """the number of parallel game environments"""
     total_timesteps: int = 10_000_000
     """total timesteps of the experiments"""
-    q_learning_rate: float = 3e-2
+    q_learning_rate: float = 3e-4
     """the learning rate of the q_network optimizer"""
     m_learning_rate: float = 1e-4
     """the learning rate of the model_network optimizer"""
@@ -126,9 +126,9 @@ class Args:
     # =========== suggestion: get inspiration from deterministic version
     N_atoms: int = 51
     """the number of atoms in the C51 approach (51)"""
-    Q_min: float = -2.
+    Q_min: float = -1.
     """the minimum value of the support of the C51 approach """
-    Q_max: float = 2.
+    Q_max: float = 1.
     """the maximum value of the support of the C51 approach """
 
 
