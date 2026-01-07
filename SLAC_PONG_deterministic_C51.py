@@ -60,7 +60,7 @@ class Args:
     """if toggled, `torch.backends.cudnn.deterministic=False`"""
     cuda: bool = True
     """if toggled, cuda will be enabled by default"""
-    track: bool = True
+    track: bool = False
     """if toggled, this experiment will be tracked with Weights and Biases"""
     save_model: bool = False
     """if toggled, the trained model will be saved to disk"""
@@ -96,7 +96,7 @@ class Args:
     """the fraction of `total-timesteps` it takes from start-e to go end-e"""
     gamma: float = 0.99
     """the discount factor"""
-    learning_starts: int = 1000
+    learning_starts: int = 10000
     """timestep to start learning"""
     train_frequency: int = 4
     """the frequency of training"""
@@ -704,6 +704,7 @@ if __name__ == '__main__':
                 #print(images.dtype, images.min().item(), images.max().item())
             actions = batch["action"]
             step_ty = batch["step_type"]
+
             model_loss, output = compute_loss(Model, images, actions, step_ty, step=pretrain_step, use_kl=use_kl)
             Model.optimizer.zero_grad()
             model_loss.backward()
@@ -843,11 +844,11 @@ if __name__ == '__main__':
             dones   = data["done"]
 
             # World model training
-            """model_loss, output = compute_loss(Model, images, actions, step_ty, use_kl=True)
+            model_loss, output = compute_loss(Model, images, actions, step_ty, use_kl=True)
             Model.optimizer.zero_grad()
             model_loss.backward()
             torch.nn.utils.clip_grad_norm_(Model.parameters(), 20.0)
-            Model.optimizer.step()"""
+            Model.optimizer.step()
 
             # Agent training
             with torch.no_grad():
@@ -865,7 +866,7 @@ if __name__ == '__main__':
                     if actual_r < 0:
                         writer.add_scalar("charts/negative_terminal_accuracy", final_pred, global_step)
 
-            if global_step % 5000 == 0:
+            if global_step % 50_000 == 0:
                 visualize_terminal_debug(agent, Model, z1, z2, actions, rewards, dones, global_step)
                 evaluate_and_record(args, Model, agent, global_step, run_name)
 
@@ -876,13 +877,13 @@ if __name__ == '__main__':
                 writer.add_scalar("losses/target_q_min", target_q.min().item(), global_step)
                 writer.add_scalar("losses/target_q_max", target_q.max().item(), global_step)
                 writer.add_scalar("losses/target_q_mean", target_q.mean().item(), global_step)
-                """writer.add_scalar("losses/mse", output["mse"].item(), global_step)
+                writer.add_scalar("losses/mse", output["mse"].item(), global_step)
                 writer.add_scalar("losses/kl_z1", output["kl_z1"].item(), global_step)
                 writer.add_scalar("losses/kl_q_raw", output["kl_q_raw"].item(), global_step)
                 writer.add_scalar("losses/kl_q", output["kl_q"].item(), global_step)
                 writer.add_scalar("losses/kl_term", output["kl_term"].item(), global_step)
                 writer.add_scalar("losses/latent_tf_mse", output["latent_tf_mse"].item(), global_step )
-                writer.add_scalar("losses/pix_tf_mse", output["pix_tf_mse"].item(), global_step)"""
+                writer.add_scalar("losses/pix_tf_mse", output["pix_tf_mse"].item(), global_step)
                 print("SPS:", int(global_step / (time.time() - start_time)))
                 writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
                 writer.add_scalar("charts/epsilon", agent.epsilon, global_step)
