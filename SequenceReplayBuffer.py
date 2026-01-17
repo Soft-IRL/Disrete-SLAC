@@ -1,3 +1,5 @@
+import torch
+
 
 class SequenceReplayBuffer:
     """
@@ -10,6 +12,7 @@ class SequenceReplayBuffer:
         self.capacity = capacity          # max *time-steps*
         self.seq_len  = seq_len           # L
         self.device   = torch.device(device)
+        self.obs_type = obs_dtype
 
         # ------------------------------------------------------------------ #
         #  storage – **CPU**, pinned so GPU transfer is DMA & non-blocking   #
